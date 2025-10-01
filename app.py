@@ -120,7 +120,8 @@ def _calculate_advanced_metrics(positions_data, bars_data):
     end_date = pd.Timestamp.now(tz='America/New_York').isoformat()
     start_date = (pd.Timestamp.now(tz='America/New_York') - pd.Timedelta(days=365*2)).isoformat()
     try:
-        spy_bars = api.get_bars(BENCHMARK_SYMBOL, "1Day", start=start_date, end=end_date, adjustment='split').df
+        # **FIX:** Request data from the 'iex' feed for free accounts
+        spy_bars = api.get_bars(BENCHMARK_SYMBOL, "1Day", start=start_date, end=end_date, adjustment='split', feed='iex').df
         spy_returns = spy_bars['close'].pct_change().dropna()
     except Exception as e:
         print(f"Could not fetch benchmark data for {BENCHMARK_SYMBOL}: {e}")
@@ -141,7 +142,7 @@ def _calculate_advanced_metrics(positions_data, bars_data):
     # Sortino Ratio
     downside_returns = aligned_returns[aligned_returns < 0]
     downside_std = downside_returns.std()
-    sortino_ratio = (aligned_returns.mean() - risk_free_rate) / downside_std * np.sqrt(252) if downside_std != 0 else 0
+    sortino_ratio = (aligned_returns.mean() - risk_free_rate) / downside_std * np.sqrt(252) if downside_std is not None and downside_std != 0 else 0
 
     # --- Alpha and Beta ---
     alpha = 0
@@ -196,11 +197,13 @@ def _fetch_alpaca_portfolio():
         asset_details = {asset.symbol: asset for asset in api.list_assets(status='active')}
         for pos in positions_data:
             asset = asset_details.get(pos['symbol'])
-            pos['sector'] = SECTOR_MAPPING.get(asset.industry, asset.industry) if asset and hasattr(asset, 'industry') and asset.industry else 'Other'
+            industry = asset.industry if asset and hasattr(asset, 'industry') and asset.industry else 'Other'
+            pos['sector'] = SECTOR_MAPPING.get(industry, industry)
         
         end_date = pd.Timestamp.now(tz='America/New_York').isoformat()
         start_date = (pd.Timestamp.now(tz='America/New_York') - pd.Timedelta(days=365*2)).isoformat()
-        barset = api.get_bars(symbols, "1Day", start=start_date, end=end_date, adjustment='split').df
+        # **FIX:** Request data from the 'iex' feed for free accounts
+        barset = api.get_bars(symbols, "1Day", start=start_date, end=end_date, adjustment='split', feed='iex').df
         for symbol in symbols:
             if not barset.empty and symbol in barset.index.get_level_values('symbol'):
                 symbol_bars = barset.loc[symbol]
@@ -231,3 +234,4 @@ def get_fred_series(series_id):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
+
