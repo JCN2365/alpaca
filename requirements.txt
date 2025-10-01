@@ -4,3 +4,4 @@ alpaca-trade-api
 fredapi
 pandas
 gunicorn
+numpy
