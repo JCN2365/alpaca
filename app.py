@@ -1,138 +1,186 @@
 import os
 import json
-from datetime import datetime, timedelta
 from flask import Flask, jsonify
 from flask_cors import CORS
 import alpaca_trade_api as tradeapi
 from fredapi import Fred
 import pandas as pd
+from datetime import datetime, timedelta
 
-# --- Initialization ---
+# Initialize Flask App and CORS
 app = Flask(__name__)
 CORS(app)
 
-# --- Caching Configuration ---
+# --- CONFIGURATION ---
 CACHE_DIR = "cache"
-CACHE_EXPIRY_SECONDS = 86400  # 24 hours
+CACHE_DURATION_SECONDS = 86400  # 24 hours
 
-# Ensure the cache directory exists
+# Create cache directory if it doesn't exist
 if not os.path.exists(CACHE_DIR):
     os.makedirs(CACHE_DIR)
 
-# --- API Configuration ---
-# Securely load API keys from environment variables set on Render
-alpaca_api_key = os.getenv('APCA_API_KEY_ID')
-alpaca_api_secret = os.getenv('APCA_API_SECRET_KEY')
-alpaca_base_url = 'https://paper-api.alpaca.markets'
-fred_api_key = os.getenv('FRED_API_KEY')
+# --- API CLIENTS SETUP ---
+# It's crucial that these environment variables are set in your deployment environment (e.g., Render).
+try:
+    alpaca_api_key = os.getenv('APCA_API_KEY_ID')
+    alpaca_secret_key = os.getenv('APCA_API_SECRET_KEY')
+    fred_api_key = os.getenv('FRED_API_KEY')
 
-# --- API Client Initialization ---
-alpaca_api = tradeapi.REST(alpaca_api_key, alpaca_api_secret, alpaca_base_url, api_version='v2') if alpaca_api_key and alpaca_api_secret else None
-fred = Fred(api_key=fred_api_key) if fred_api_key else None
+    # Use paper trading endpoint for development/testing
+    base_url = 'https://paper-api.alpaca.markets'
+    api = tradeapi.REST(alpaca_api_key, alpaca_secret_key, base_url, api_version='v2')
+    fred = Fred(api_key=fred_api_key)
+except Exception as e:
+    print(f"ERROR: Could not initialize API clients. Make sure environment variables are set. Details: {e}")
+    api = None
+    fred = None
 
+# --- CACHING LOGIC ---
+def _fetch_and_cache(cache_key, fetch_function):
+    """
+    Executes the fetch_function, saves its result to a cache file, and returns the result.
+    """
+    print(f"CACHE MISS: Fetching fresh data for '{cache_key}'...")
+    try:
+        data = fetch_function()
+        cache_path = os.path.join(CACHE_DIR, f"{cache_key}.json")
+        with open(cache_path, 'w') as f:
+            json.dump(data, f)
+        return data
+    except Exception as e:
+        print(f"API FETCH ERROR for '{cache_key}': {e}")
+        return None
 
-# --- Caching Helper Functions ---
+def _get_cached_or_fetch(cache_key, fetch_function, fallback=True):
+    """
+    Tries to retrieve data from cache. If it's stale or doesn't exist, it calls the fetch_function.
+    If the fetch fails, it can fall back to using stale cache data.
+    """
+    cache_path = os.path.join(CACHE_DIR, f"{cache_key}.json")
+    
+    if os.path.exists(cache_path):
+        file_mod_time = datetime.fromtimestamp(os.path.getmtime(cache_path))
+        if datetime.now() - file_mod_time < timedelta(seconds=CACHE_DURATION_SECONDS):
+            print(f"CACHE HIT: Using recent data for '{cache_key}'.")
+            with open(cache_path, 'r') as f:
+                return json.load(f)
 
-def get_cached_data(cache_filename):
-    """
-    Reads data from a cache file if it exists and is not expired.
-    Returns the cached data or None.
-    """
-    if os.path.exists(cache_filename):
-        with open(cache_filename, 'r') as f:
-            cache = json.load(f)
-            timestamp = datetime.fromisoformat(cache['timestamp'])
-            if datetime.utcnow() - timestamp < timedelta(seconds=CACHE_EXPIRY_SECONDS):
-                return cache['data'] # Cache is valid
-    return None
+    # If cache is stale or doesn't exist, fetch new data
+    fresh_data = _fetch_and_cache(cache_key, fetch_function)
 
-def write_cached_data(cache_filename, data):
-    """
-    Writes new data and a current timestamp to a cache file.
-    """
-    cache_content = {
-        'timestamp': datetime.utcnow().isoformat(),
-        'data': data
-    }
-    with open(cache_filename, 'w') as f:
-        json.dump(cache_content, f)
-        
-def get_fallback_data(cache_filename):
-    """
-    Reads stale data from a cache file if it exists, used when API calls fail.
-    """
-    if os.path.exists(cache_filename):
-        with open(cache_filename, 'r') as f:
-            return json.load(f)['data']
-    return None
+    if fresh_data is not None:
+        return fresh_data
+    elif fallback and os.path.exists(cache_path):
+        # If fetch failed, fall back to stale cache if it exists
+        print(f"FALLBACK: Using stale cache for '{cache_key}' due to fetch error.")
+        with open(cache_path, 'r') as f:
+            return json.load(f)
+    else:
+        # If fetch failed and there's no cache to fall back on
+        return {"error": f"Failed to fetch data for {cache_key} and no cache was available."}
 
-# --- API Endpoints ---
+# --- API ENDPOINTS ---
 
 @app.route('/')
 def home():
-    return "Backend server with daily caching is running."
+    return "Backend server is running."
 
-@app.route('/api/alpaca/positions', methods=['GET'])
-def get_alpaca_positions():
+def _fetch_alpaca_portfolio():
     """
-    Fetches Alpaca positions, using a daily cache with fallback.
+    Internal function to fetch all necessary Alpaca data: account, positions, and historical bars.
     """
-    cache_file = os.path.join(CACHE_DIR, "alpaca_positions.json")
+    if not api:
+        raise ConnectionError("Alpaca API client is not initialized.")
+
+    account = api.get_account()
+    positions = api.list_positions()
+
+    # Prepare data to be JSON serializable
+    account_data = {
+        "portfolio_value": account.portfolio_value,
+        "equity": account.equity,
+        "last_equity": account.last_equity,
+        "cash": account.cash
+    }
     
-    # 1. Try to get fresh, valid cache
-    cached_data = get_cached_data(cache_file)
-    if cached_data:
-        return jsonify(cached_data)
+    positions_data = [
+        {
+            "symbol": p.symbol,
+            "qty": p.qty,
+            "market_value": p.market_value,
+            "unrealized_intraday_pl": p.unrealized_intraday_pl,
+            "unrealized_pl": p.unrealized_pl,
+            "unrealized_plpc": p.unrealized_plpc,
+            "side": p.side,
+            "asset_id": p.asset_id
+        } for p in positions
+    ]
 
-    # 2. If cache is expired or missing, fetch from API
-    if not alpaca_api:
-        return jsonify({"error": "Alpaca API keys not configured"}), 500
+    # Fetch asset details and historical bars only if there are positions
+    bars_data = {}
+    if positions:
+        symbols = [p.symbol for p in positions]
         
-    try:
-        positions = alpaca_api.list_positions()
-        positions_data = [p._asdict() for p in positions]
-        write_cached_data(cache_file, positions_data) # Update cache
-        return jsonify(positions_data)
-    except Exception as e:
-        # 3. If API fails, try to serve stale data as a fallback
-        fallback_data = get_fallback_data(cache_file)
-        if fallback_data:
-            return jsonify(fallback_data)
-        else:
-            # Only fail if API is down AND there's no cache at all
-            return jsonify({"error": f"API fetch failed and no cache available: {str(e)}"}), 500
+        # Add sector information
+        asset_details = {asset.symbol: asset for asset in api.list_assets(status='active')}
+        for pos in positions_data:
+            pos['sector'] = asset_details.get(pos['symbol'], {}).sector or 'Other'
+            
+        # Fetch historical data
+        end_date = pd.Timestamp.now(tz='America/New_York').isoformat()
+        start_date = (pd.Timestamp.now(tz='America/New_York') - pd.Timedelta(days=365*2)).isoformat() # Approx 2 years for 252 trading days
+        
+        barset = api.get_bars(symbols, "1Day", start=start_date, end=end_date, adjustment='split').df
+        # Reformat the pandas DataFrame into the JSON structure the frontend expects
+        for symbol in symbols:
+            if symbol in barset.index.get_level_values('symbol'):
+                symbol_bars = barset.loc[symbol]
+                bars_data[symbol] = [
+                    {"t": bar.name.strftime('%Y-%m-%dT%H:%M:%SZ'), "c": bar.close} for bar in symbol_bars.itertuples()
+                ]
 
-@app.route('/api/fred/series/<series_id>', methods=['GET'])
+    return {"account": account_data, "positions": positions_data, "bars": bars_data}
+
+
+@app.route('/api/alpaca/portfolio')
+def get_alpaca_portfolio():
+    """
+    Provides all portfolio data (account, positions, bars) in a single call, with caching.
+    """
+    portfolio_data = _get_cached_or_fetch("alpaca_portfolio", _fetch_alpaca_portfolio)
+    if "error" in portfolio_data:
+        return jsonify(portfolio_data), 500
+    return jsonify(portfolio_data)
+
+
+def _fetch_fred_series(series_id):
+    """
+    Internal function to fetch a specific FRED series.
+    """
+    if not fred:
+        raise ConnectionError("FRED API client is not initialized.")
+    data = fred.get_series(series_id)
+    # Convert pandas Series to a list of dicts {x: date, y: value}
+    return [
+        {"x": index.strftime('%Y-%m-%d'), "y": value}
+        for index, value in data.items() if pd.notna(value)
+    ]
+
+@app.route('/api/fred/series/<series_id>')
 def get_fred_series(series_id):
     """
-    Fetches FRED series data, using a daily cache with fallback.
+    Provides data for a given FRED series ID, with caching.
     """
-    cache_file = os.path.join(CACHE_DIR, f"fred_{series_id}.json")
+    # Use lambda to pass series_id to the fetch function
+    series_data = _get_cached_or_fetch(f"fred_{series_id}", lambda: _fetch_fred_series(series_id))
+    if "error" in series_data:
+        return jsonify(series_data), 500
+    return jsonify(series_data)
 
-    # 1. Try to get fresh, valid cache
-    cached_data = get_cached_data(cache_file)
-    if cached_data:
-        return jsonify(cached_data)
 
-    # 2. If cache is expired or missing, fetch from API
-    if not fred:
-        return jsonify({"error": "FRED API key not configured"}), 500
+if __name__ == "__main__":
+    # Use a port that Render will provide via the PORT environment variable,
+    # default to 5000 for local development.
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
 
-    try:
-        data = fred.get_series(series_id)
-        data_cleaned = data.dropna()
-        formatted_data = [{"x": index.strftime('%Y-%m-%d'), "y": value} for index, value in data_cleaned.items()]
-        write_cached_data(cache_file, formatted_data) # Update cache
-        return jsonify(formatted_data)
-    except Exception as e:
-        # 3. If API fails, try to serve stale data as a fallback
-        fallback_data = get_fallback_data(cache_file)
-        if fallback_data:
-            return jsonify(fallback_data)
-        else:
-            # Only fail if API is down AND there's no cache at all
-            return jsonify({"error": f"API fetch failed for '{series_id}' and no cache available: {str(e)}"}), 404
-
-# --- Main Execution ---
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
