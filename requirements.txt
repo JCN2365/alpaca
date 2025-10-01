@@ -1,0 +1,6 @@
+Flask
+Flask-Cors
+alpaca-trade-api
+fredapi
+pandas
+gunicorn
